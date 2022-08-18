@@ -153,10 +153,10 @@ func (c *ConnRbd) localAttachVolume() (map[string]string, error) {
 	_, err = os.Readlink(rbdDevPath)
 	if err != nil {
 		cmd := []string{"map", poolVolume, "--pool", poolName}
-		klog.Infof("Start exec map the pool %s the volume %s command", poolName, poolVolume)
+		klog.Infof("Starting map the volume %s to host name", poolVolume)
 		result, err := utilsExecute("rbd", cmd...)
 		if err != nil {
-			klog.Error(fmt.Sprintf("rbd map command exec failed, %v", err))
+			klog.Error(fmt.Sprintf("rbd map command exec failed: %v. Error output: %s", err, result))
 			return nil, err
 		}
 		klog.Infof("command succeeded: rbd map path is %s", result)

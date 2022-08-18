@@ -2,21 +2,37 @@ package openstack
 
 import (
 	"fmt"
-	"gopkg.in/ini.v1"
 	"strings"
 
 	"github.com/gophercloud/gophercloud"
 	"github.com/gophercloud/gophercloud/openstack"
 	"github.com/gophercloud/gophercloud/openstack/blockstorage/noauth"
+	"github.com/gophercloud/gophercloud/openstack/blockstorage/v3/attachments"
 	"github.com/gophercloud/gophercloud/openstack/blockstorage/v3/snapshots"
 	"github.com/gophercloud/gophercloud/openstack/blockstorage/v3/volumes"
 	"k8s.io/klog/v2"
 )
 
-type Config struct {
-	Global
-	BlockStorage
-}
+const (
+	cinderAuthStrategy    = "cinderAuthStrategy"
+	CinderVolumeType      = "cinderVolumeType"
+	CinderBackendDriver   = "cinderBackendDriver"
+	CinderEndpoint        = "cinderEndpoint"
+	OsUserName            = "osUserName"
+	OsProject             = "osProject"
+	OsDomainName          = "osDomainName"
+	OsRegion              = "osRegion"
+	OsIdentityEndpoint    = "osIdentityEndpoint"
+	OsCinderEndpointType  = "osCinderEndpointType"
+	OsUserPassword        = "osUserPassword"
+	CephClientUser        = "cephClientUser"
+	CephClientKey         = "cephClientKey"
+	NodeVolumeAttachLimit = "nodeVolumeAttachLimit"
+	ConnectionProtocol    = "connectionProtocol"
+	Local                 = "local"
+	iSCSI                 = "iscsi"
+	RBD                   = "rbd"
+)
 
 type IOpenstack interface {
 	CreateVolume(name, zone, volType, snapshotID, sourceVolID string, size int) (*volumes.Volume, error)
@@ -32,105 +48,30 @@ type IOpenstack interface {
 	ListSnapshot(filter map[string]string) ([]snapshots.Snapshot, string, error)
 	GetSnapshotByID(snapshotID string) (*snapshots.Snapshot, error)
 	ExpandVolume(volumeID string, status string, size int) error
-	InitializeConnection(volumeID string) (map[string]interface{}, error)
-	GetBsOpts() BlockStorage
+	CreateAttachment(volumeID string) (*attachments.Attachment, error)
+	GetAttachmentByVolumeId(volID string) (*attachments.Attachment, error)
+	DeleteAttachmentByVolumeId(volID string) error
+	GetAttachmentConnentionInfo(volumeID string) (map[string]interface{}, error)
 	CheckBlockStorageAPI() error
-	GetMaxVolumeLimit() int64
-}
-
-type Global struct {
-	AuthUrl           string                   `ini:"auth-url"`
-	Username          string                   `ini:"username"`
-	Password          string                   `ini:"password"`
-	UserDomainName    string                   `ini:"user-domain-name"`
-	ProjectDomainName string                   `ini:"project-domain-name"`
-	ProjectName       string                   `ini:"project-name"`
-	TenantName        string                   `ini:"tenant-name"`
-	RegionName        string                   `ini:"region-name"`
-	EndpointType      gophercloud.Availability `ini:"endpoint-type"`
-}
-
-type BlockStorage struct {
-	AuthStrategy          string `ini:"auth-strategy"`
-	CinderListenAddr      string `ini:"cinder-listen-addr"`
-	NodeVolumeAttachLimit int64  `ini:"node-volume-attach-limit"`
-	LvmVolumeType         string `ini:"lvm-volume-type"`
-	CephVolumeType        string `ini:"ceph-volume-type"`
-	LocalVolumeType       string `ini:"local-volume-type"`
 }
 
 type Openstack struct {
 	BlockStorageClient *gophercloud.ServiceClient
 	EsOpts             gophercloud.EndpointOpts
-	BsOpts             BlockStorage
+
+	VolumeType    string
+	BackendDriver string
 }
 
-type EndpointOpts struct {
-	Region       string
-	Availability gophercloud.Availability
-}
-
-func loadCfg(cloudConf string) *Config {
-	klog.V(3).Infof("Start load config file %s", cloudConf)
-	config := &Config{}
-	cfg, err := ini.Load(cloudConf)
-	if err != nil {
-		klog.Fatalf("Load config file failed, %v", err)
-	}
-	err = cfg.MapTo(&config)
-	if err != nil {
-		klog.Fatalf("Parse config file failed, %v", err)
-	}
-	return config
-}
-
-func CreateOpenstackClient(cloudConf string) (IOpenstack, error) {
+func CreateOpenstackClient(secrets map[string]string) (IOpenstack, error) {
+	klog.InfoS("xxxxxxxxxxxxxxxxxxxx", "openstack secret", secrets)
 	var err error
-	config := loadCfg(cloudConf)
-	provider, err := NewOpenstackClient(config)
-	if err != nil {
-		klog.Error(fmt.Sprintf("Get openstack provider client failed, %v", err))
-	}
-	esOpts := gophercloud.EndpointOpts{
-		Region:       config.RegionName,
-		Availability: config.EndpointType,
-	}
-	var blockStorageClient *gophercloud.ServiceClient
-	if strings.ToLower(config.AuthStrategy) == "keystone" {
-		blockStorageClient, err = openstack.NewBlockStorageV3(provider, esOpts)
-		if err != nil {
-			klog.Error(fmt.Sprintf("Get keystone openstack client failed, %v", err))
-			return nil, err
-		}
-	} else if strings.ToLower(config.AuthStrategy) == "noauth" {
-		blockStorageClient, err = noauth.NewBlockStorageNoAuthV3(provider, noauth.EndpointOpts{CinderEndpoint: config.CinderListenAddr})
-		if err != nil {
-			klog.Error(fmt.Sprintf("Get noauth openstack client failed, %v", err))
-			return nil, err
-		}
-	}
-	OsInstance := &Openstack{
-		BlockStorageClient: blockStorageClient,
-		BsOpts: BlockStorage{
-			AuthStrategy:          config.AuthStrategy,
-			CinderListenAddr:      config.CinderListenAddr,
-			NodeVolumeAttachLimit: config.NodeVolumeAttachLimit,
-			LocalVolumeType:       config.LocalVolumeType,
-			LvmVolumeType:         config.LvmVolumeType,
-			CephVolumeType:        config.CephVolumeType,
-		},
-		EsOpts: esOpts,
-	}
-	return OsInstance, nil
-}
-
-func NewOpenstackClient(cfg *Config) (*gophercloud.ProviderClient, error) {
 	opts := gophercloud.AuthOptions{
-		IdentityEndpoint: cfg.AuthUrl,
-		Username:         cfg.Username,
-		Password:         cfg.Password,
-		TenantName:       cfg.TenantName,
-		DomainName:       cfg.ProjectDomainName,
+		IdentityEndpoint: secrets[OsIdentityEndpoint],
+		Username:         secrets[OsUserName],
+		Password:         secrets[OsUserPassword],
+		DomainName:       secrets[OsDomainName],
+		TenantName:       secrets[OsProject],
 		AllowReauth:      true,
 	}
 	provider, err := openstack.AuthenticatedClient(opts)
@@ -138,5 +79,39 @@ func NewOpenstackClient(cfg *Config) (*gophercloud.ProviderClient, error) {
 		klog.Error(fmt.Sprintf("Request openstack provider client failed, %v", err))
 		return nil, err
 	}
-	return provider, nil
+
+	if err != nil {
+		klog.Error(fmt.Sprintf("Get openstack provider client failed, %v", err))
+	}
+
+	var blockStorageClient *gophercloud.ServiceClient
+	if strings.ToLower(secrets[cinderAuthStrategy]) == "keystone" {
+		esOpts := gophercloud.EndpointOpts{
+			Region:       secrets[OsRegion],
+			Availability: gophercloud.Availability(secrets[OsCinderEndpointType]),
+		}
+		blockStorageClient, err = openstack.NewBlockStorageV3(provider, esOpts)
+		if err != nil {
+			klog.Error(fmt.Sprintf("Get keystone openstack client failed, %v", err))
+			return nil, err
+		}
+	} else if strings.ToLower(secrets[cinderAuthStrategy]) == "noauth" {
+		blockStorageClient, err = noauth.NewBlockStorageNoAuthV3(provider, noauth.EndpointOpts{CinderEndpoint: secrets["cinderEndpoint"]})
+		if err != nil {
+			klog.Error(fmt.Sprintf("Get noauth openstack client failed, %v", err))
+			return nil, err
+		}
+	}
+	if err != nil {
+		klog.Error(fmt.Sprintf("The parameter 'nodeVolumeAttachLimit' must be a integer."))
+	}
+	OsInstance := &Openstack{
+		BlockStorageClient: blockStorageClient,
+		EsOpts: gophercloud.EndpointOpts{
+			Region:       secrets[OsRegion],
+			Availability: gophercloud.Availability(secrets[OsCinderEndpointType]),
+		},
+		VolumeType: secrets[CinderVolumeType],
+	}
+	return OsInstance, nil
 }

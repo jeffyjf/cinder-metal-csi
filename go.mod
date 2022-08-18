@@ -11,7 +11,6 @@ require (
 	golang.org/x/sys v0.0.0-20220721230656-c6bc011c0c49
 	google.golang.org/grpc v1.48.0
 	google.golang.org/protobuf v1.28.0
-	gopkg.in/ini.v1 v1.51.0
 	k8s.io/cloud-provider v0.24.3
 	k8s.io/klog/v2 v2.70.1
 	k8s.io/mount-utils v0.24.3

@@ -1,5 +1,5 @@
 # This YAML file contains RBAC API objects,
-# which are necessary to run csi controller plugin
+# which are necessary to run ciner-metal-csi controller plugin
 
 apiVersion: v1
 kind: ServiceAccount

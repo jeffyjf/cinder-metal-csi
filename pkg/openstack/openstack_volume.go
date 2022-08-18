@@ -6,11 +6,13 @@ import (
 	"io"
 	"net/url"
 	"os"
+	"runtime"
 	"strconv"
 	"strings"
 
 	"github.com/gophercloud/gophercloud/openstack"
 	"github.com/gophercloud/gophercloud/openstack/blockstorage/extensions/volumeactions"
+	"github.com/gophercloud/gophercloud/openstack/blockstorage/v3/attachments"
 	"github.com/gophercloud/gophercloud/openstack/blockstorage/v3/snapshots"
 	"github.com/gophercloud/gophercloud/openstack/blockstorage/v3/volumes"
 	"github.com/gophercloud/gophercloud/openstack/compute/apiversions"
@@ -69,6 +71,60 @@ func (op *Openstack) DetachVolume(volumeID string) error {
 		return err
 	}
 	return nil
+}
+
+func (op *Openstack) CreateAttachment(volumeID string) (*attachments.Attachment, error) {
+	arch := runtime.GOARCH
+	if arch == "amd64" {
+		arch = "x86_64"
+	}
+	opts := attachments.CreateOpts{
+		VolumeUUID: volumeID,
+		Connector: map[string]interface{}{
+			"platform": arch,
+			"os_type":  runtime.GOOS,
+			"mode":     "rw",
+		},
+	}
+	attach, err := attachments.Create(op.BlockStorageClient, opts).Extract()
+	if err != nil {
+		return nil, err
+	}
+	return attach, nil
+}
+
+func (op *Openstack) GetAttachmentByVolumeId(volID string) (*attachments.Attachment, error) {
+	vol, err := op.GetVolumeByID(volID)
+	if err != nil {
+		return nil, err
+	}
+	attach, err := attachments.Get(op.BlockStorageClient, vol.Attachments[0].AttachmentID).Extract()
+	if err != nil {
+		return nil, err
+	}
+	return attach, err
+}
+
+func (op *Openstack) DeleteAttachmentByVolumeId(volID string) error {
+	vol, err := op.GetVolumeByID(volID)
+	if err != nil {
+		return err
+	}
+	for _, attach := range vol.Attachments {
+		res := attachments.Delete(op.BlockStorageClient, attach.AttachmentID)
+		if res.Err != nil {
+			return res.Err
+		}
+	}
+	return nil
+}
+
+func (op *Openstack) GetAttachmentConnentionInfo(volumeID string) (map[string]interface{}, error) {
+	attach, err := op.GetAttachmentByVolumeId(volumeID)
+	if err != nil {
+		return nil, err
+	}
+	return attach.ConnectionInfo, nil
 }
 
 func (op *Openstack) GetVolumeByName(volumeName string) ([]volumes.Volume, error) {
@@ -255,42 +311,38 @@ func (op *Openstack) GetAvailability() (string, error) {
 	return zoneName, nil
 }
 
-func (op *Openstack) InitializeConnection(volumeID string) (map[string]interface{}, error) {
-	opts := &volumeactions.InitializeConnectionOpts{}
-	volume, err := op.GetVolumeByID(volumeID)
-	if err != nil {
-		return nil, err
-	}
-	klog.Infof("Get the volume type is %s", volume.VolumeType)
-	if strings.EqualFold(volume.VolumeType, op.BsOpts.LocalVolumeType) {
-		connInfo := map[string]interface{}{}
-		connInfo["driver_volume_type"] = "local"
-		connInfo["volume_id"] = volumeID
-		return connInfo, nil
-	}
+// func (op *Openstack) InitializeConnection(volumeID string) (map[string]interface{}, error) {
+// 	opts := &volumeactions.InitializeConnectionOpts{}
+// 	volume, err := op.GetVolumeByID(volumeID)
+// 	if err != nil {
+// 		return nil, err
+// 	}
+// 	klog.Infof("Get the volume type is %s", volume.VolumeType)
+// 	if strings.EqualFold(volume.VolumeType, op.BsOpts.LocalVolumeType) {
+// 		connInfo := map[string]interface{}{}
+// 		connInfo["driver_volume_type"] = "local"
+// 		connInfo["volume_id"] = volumeID
+// 		return connInfo, nil
+// 	}
 
-	if strings.EqualFold(volume.VolumeType, op.BsOpts.LvmVolumeType) {
-		initiatorName, err := getISCSIInitiator()
-		klog.V(3).Infof("Get iscsi initiator name %s", initiatorName)
-		if err != nil {
-			klog.Error("Get iscsi initiator name failed %s", err)
-			return nil, err
-		}
-		opts = &volumeactions.InitializeConnectionOpts{
-			Initiator: initiatorName,
-		}
-	}
-	klog.Info("Request initialize connection volume")
-	connInfo, err := volumeactions.InitializeConnection(op.BlockStorageClient, volumeID, opts).Extract()
-	if err != nil {
-		return nil, err
-	}
-	return connInfo, nil
-}
-
-func (op *Openstack) GetBsOpts() BlockStorage {
-	return op.BsOpts
-}
+// 	if strings.EqualFold(volume.VolumeType, op.BsOpts.LvmVolumeType) {
+// 		initiatorName, err := getISCSIInitiator()
+// 		klog.V(3).Infof("Get iscsi initiator name %s", initiatorName)
+// 		if err != nil {
+// 			klog.Error("Get iscsi initiator name failed %s", err)
+// 			return nil, err
+// 		}
+// 		opts = &volumeactions.InitializeConnectionOpts{
+// 			Initiator: initiatorName,
+// 		}
+// 	}
+// 	klog.Info("Request initialize connection volume")
+// 	connInfo, err := volumeactions.InitializeConnection(op.BlockStorageClient, volumeID, opts).Extract()
+// 	if err != nil {
+// 		return nil, err
+// 	}
+// 	return connInfo, nil
+// }
 
 func (op *Openstack) CheckBlockStorageAPI() error {
 	_, err := apiversions.List(op.BlockStorageClient).AllPages()
@@ -298,13 +350,6 @@ func (op *Openstack) CheckBlockStorageAPI() error {
 		return err
 	}
 	return nil
-}
-
-func (op *Openstack) GetMaxVolumeLimit() int64 {
-	if op.BsOpts.NodeVolumeAttachLimit > 0 || op.BsOpts.NodeVolumeAttachLimit <= 256 {
-		return op.BsOpts.NodeVolumeAttachLimit
-	}
-	return defaultMaxVolAttachLimit
 }
 
 func getISCSIInitiator() (string, error) {

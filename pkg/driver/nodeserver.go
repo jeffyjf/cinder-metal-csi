@@ -25,12 +25,12 @@ const (
 
 type nodeServer struct {
 	driver *Driver
-	cloud  openstack.IOpenstack
 	mount  mount.IMount
 }
 
 func (n *nodeServer) NodeStageVolume(ctx context.Context, req *csi.NodeStageVolumeRequest) (*csi.NodeStageVolumeResponse, error) {
 	volumeID := req.GetVolumeId()
+	req.GetPublishContext()
 	if volumeID == "" {
 		return nil, status.Error(codes.InvalidArgument, "NodeStageVolume: The volume id must provider")
 	}
@@ -47,18 +47,21 @@ func (n *nodeServer) NodeStageVolume(ctx context.Context, req *csi.NodeStageVolu
 		klog.V(3).Infof("NodeStageVolume: The volume %s type is block", volumeID)
 		return &csi.NodeStageVolumeResponse{}, nil
 	}
-	vol, err := n.cloud.GetVolumeByID(volumeID)
+	cloud, err := openstack.CreateOpenstackClient(req.GetSecrets())
+	if err != nil {
+		return nil, status.Error(codes.Internal, fmt.Sprintf("NodeStageVolume: Failed to initial openstack cinder client: %v", err))
+	}
+	vol, err := cloud.GetVolumeByID(volumeID)
 	if err != nil {
 		if vol == nil {
 			return nil, status.Errorf(codes.NotFound, fmt.Sprintf("NodeUnstageVolume: The openstack cinder service not found the volume %s", volumeID))
 		}
 		return nil, status.Errorf(codes.Internal, fmt.Sprintf("NodeUnstageVolume: Get volume info failed %v", err))
 	}
-	connInfo, err := n.cloud.InitializeConnection(volumeID)
+	connInfo, err := cloud.GetAttachmentConnentionInfo(volumeID)
 	if err != nil {
 		return nil, status.Errorf(codes.Internal, fmt.Sprintf("NodeStageVolume: Initialize the volume %s conneciton failed, %v", volumeID, err))
 	}
-
 	protocol := connInfo["driver_volume_type"]
 	conn := brick.NewConnector(fmt.Sprint(protocol), connInfo)
 	result, err := conn.ConnectVolume()
@@ -115,6 +118,7 @@ func (n *nodeServer) NodeStageVolume(ctx context.Context, req *csi.NodeStageVolu
 }
 
 func (n *nodeServer) NodeUnstageVolume(ctx context.Context, req *csi.NodeUnstageVolumeRequest) (*csi.NodeUnstageVolumeResponse, error) {
+
 	volumeID := req.GetVolumeId()
 	if volumeID == "" {
 		return nil, status.Error(codes.InvalidArgument, "NodeUnstageVolume: The volume id must provider")
@@ -123,24 +127,29 @@ func (n *nodeServer) NodeUnstageVolume(ctx context.Context, req *csi.NodeUnstage
 	if sourcePath == "" {
 		return nil, status.Error(codes.InvalidArgument, "NodeUnstageVolume: The volume staging target path must provider")
 	}
-	vol, err := n.cloud.GetVolumeByID(volumeID)
-	if err != nil {
-		if vol == nil {
-			return nil, status.Errorf(codes.NotFound, fmt.Sprintf("NodeUnstageVolume: The openstack cinder service not found the volume %s", volumeID))
-		}
-		return nil, status.Errorf(codes.Internal, fmt.Sprintf("NodeUnstageVolume: Get volume info failed %v", err))
-	}
+	//cloud, err := openstack.CreateOpenstackClient(req.)
+	// if err != nil {
+	// 	return nil, status.Error(codes.Internal, fmt.Sprintf("CreateVolume: Failed to initial openstack cinder client: %v", err))
+	// }
+	// vol, err := n.cloud.GetVolumeByID(volumeID)
+	// if err != nil {
+	// 	if vol == nil {
+	// 		return nil, status.Errorf(codes.NotFound, fmt.Sprintf("NodeUnstageVolume: The openstack cinder service not found the volume %s", volumeID))
+	// 	}
+	// 	return nil, status.Errorf(codes.Internal, fmt.Sprintf("NodeUnstageVolume: Get volume info failed %v", err))
+	// }
 	klog.Infof("NodeUnstageVolume: Cancel mount the volume %s, volume path is %s", volumeID, sourcePath)
-	err = n.mount.UnmountPath(sourcePath)
+	err := n.mount.UnmountPath(sourcePath)
 	if err != nil {
 		return nil, status.Errorf(codes.Internal, fmt.Sprintf("NodeUnstageVolume: Unmount the volume path %s failed, %v", sourcePath, err))
 	}
-	connInfo, err := n.cloud.InitializeConnection(volumeID)
-	if err != nil {
-		return nil, status.Errorf(codes.Internal, fmt.Sprintf("NodeUnstageVolume: Initialize the volume %s conneciton failed, %v", volumeID, err))
-	}
+	connInfo := map[string]string{}
+	//connInfo := req.g
+	// if err != nil {
+	// 	return nil, status.Errorf(codes.Internal, fmt.Sprintf("NodeUnstageVolume: Initialize the volume %s conneciton failed, %v", volumeID, err))
+	// }
 	protocol := connInfo["driver_volume_type"]
-	conn := brick.NewConnector(fmt.Sprint(protocol), connInfo)
+	conn := brick.NewConnector(fmt.Sprint(protocol), map[string]interface{}{})
 	err = conn.DisConnectVolume()
 	klog.Infof("NodeUnstageVolume: Disconnector the volume %s", volumeID)
 	if err != nil {
@@ -197,10 +206,10 @@ func (n *nodeServer) NodePublishVolume(ctx context.Context, req *csi.NodePublish
 			return nil, status.Errorf(codes.Internal, fmt.Sprintf("NodePublishVolume: Exec format and mount volume failed %v", err))
 		}
 	}
-	err = n.cloud.AttachVolume(volumeID, targetPath, n.driver.nodeId)
-	if err != nil {
-		return nil, status.Errorf(codes.Internal, fmt.Sprintf("NodePublishVolume: Set volume %s status to attached failed %v", volumeID, err))
-	}
+	// err = n.cloud.AttachVolume(volumeID, targetPath, n.driver.nodeId)
+	// if err != nil {
+	// 	return nil, status.Errorf(codes.Internal, fmt.Sprintf("NodePublishVolume: Set volume %s status to attached failed %v", volumeID, err))
+	// }
 	return &csi.NodePublishVolumeResponse{}, nil
 }
 
@@ -213,22 +222,22 @@ func (n *nodeServer) NodeUnpublishVolume(ctx context.Context, req *csi.NodeUnpub
 	if targetPath == "" {
 		return nil, status.Error(codes.InvalidArgument, "NodeUnpublishVolume: The volume target path must provider")
 	}
-	vol, err := n.cloud.GetVolumeByID(volumeID)
-	if err != nil {
-		if vol == nil {
-			return nil, status.Errorf(codes.NotFound, fmt.Sprintf("NodeUnpublishVolume: The openstack cinder service not found the volume %s", volumeID))
-		}
-		return nil, status.Errorf(codes.Internal, fmt.Sprintf("NodeUnpublishVolume: Get volume info failed %v", err))
-	}
+	// vol, err := n.cloud.GetVolumeByID(volumeID)
+	// if err != nil {
+	// 	if vol == nil {
+	// 		return nil, status.Errorf(codes.NotFound, fmt.Sprintf("NodeUnpublishVolume: The openstack cinder service not found the volume %s", volumeID))
+	// 	}
+	// 	return nil, status.Errorf(codes.Internal, fmt.Sprintf("NodeUnpublishVolume: Get volume info failed %v", err))
+	// }
 	klog.Infof("NodeUnpublishVolume: Cancel mount the volume %s, volume path is %s", volumeID, targetPath)
-	err = n.mount.UnmountPath(targetPath)
+	err := n.mount.UnmountPath(targetPath)
 	if err != nil {
 		return nil, status.Errorf(codes.Internal, fmt.Sprintf("NodeUnpublishVolume: Unmount the volume path %s failed, %v", targetPath, err))
 	}
-	err = n.cloud.DetachVolume(volumeID)
-	if err != nil {
-		return nil, status.Errorf(codes.Internal, fmt.Sprintf("NodeUnpublishVolume: Set volume %s status to detached failed %v", volumeID, err))
-	}
+	// err = n.cloud.DetachVolume(volumeID)
+	// if err != nil {
+	// 	return nil, status.Errorf(codes.Internal, fmt.Sprintf("NodeUnpublishVolume: Set volume %s status to detached failed %v", volumeID, err))
+	// }
 	return &csi.NodeUnpublishVolumeResponse{}, nil
 }
 
@@ -303,13 +312,13 @@ func (n *nodeServer) NodeExpandVolume(ctx context.Context, req *csi.NodeExpandVo
 		klog.V(3).Infof(fmt.Sprintf("NodeExpandVolume called for %s at %s. Since it is a block device, ignoring...", volumeID, targetPath))
 		return &csi.NodeExpandVolumeResponse{}, nil
 	}
-	vol, err := n.cloud.GetVolumeByID(volumeID)
-	if err != nil {
-		if vol == nil {
-			return nil, status.Errorf(codes.NotFound, fmt.Sprintf("NodeExpandVolume: The openstack cinder service not found the volume %s", volumeID))
-		}
-		return nil, status.Errorf(codes.Internal, fmt.Sprintf("NodeExpandVolume: Get volume info failed %v", err))
-	}
+	// vol, err := n.cloud.GetVolumeByID(volumeID)
+	// if err != nil {
+	// 	if vol == nil {
+	// 		return nil, status.Errorf(codes.NotFound, fmt.Sprintf("NodeExpandVolume: The openstack cinder service not found the volume %s", volumeID))
+	// 	}
+	// 	return nil, status.Errorf(codes.Internal, fmt.Sprintf("NodeExpandVolume: Get volume info failed %v", err))
+	// }
 	output, err := n.mount.GetFsMount(targetPath)
 	if err != nil {
 		return nil, status.Errorf(codes.Internal, fmt.Sprintf("NodeExpandVolume: Get the volume file system mount info failed, %v", err))
@@ -362,17 +371,16 @@ func (n *nodeServer) NodeGetCapabilities(ctx context.Context, req *csi.NodeGetCa
 
 func (n *nodeServer) NodeGetInfo(ctx context.Context, req *csi.NodeGetInfoRequest) (*csi.NodeGetInfoResponse, error) {
 	nodeID := n.driver.nodeId
-	maxVolumesPerNode := n.cloud.GetMaxVolumeLimit()
+	//	maxVolumesPerNode := n.cloud.GetMaxVolumeLimit()
 	return &csi.NodeGetInfoResponse{
-		NodeId:            nodeID,
-		MaxVolumesPerNode: maxVolumesPerNode,
+		NodeId: nodeID,
+		//		MaxVolumesPerNode: maxVolumesPerNode,
 	}, nil
 }
 
-func NewNodeServer(d *Driver, cloud openstack.IOpenstack, mount mount.IMount) csi.NodeServer {
+func NewNodeServer(d *Driver, mount mount.IMount) csi.NodeServer {
 	return &nodeServer{
 		driver: d,
-		cloud:  cloud,
 		mount:  mount,
 	}
 }
@@ -388,16 +396,17 @@ func collectMountOptions(fsType string, options []string) []string {
 
 // nodePublishBlockVolume mount the block device type volume
 func nodePublishBlockVolume(req *csi.NodePublishVolumeRequest, ns *nodeServer, mountOptions []string) (*csi.NodePublishVolumeResponse, error) {
-	volumeID := req.GetVolumeId()
+	//volumeID := req.GetVolumeId()
 	targetPath := req.GetTargetPath()
 	podVolumePath := filepath.Dir(targetPath)
-	connInfo, err := ns.cloud.InitializeConnection(volumeID)
-	if err != nil {
-		return nil, status.Errorf(codes.Internal, fmt.Sprintf("Initialize volume %s connection failed %v", volumeID, err))
-	}
+	// connInfo, err := ns.cloud.InitializeConnection(volumeID)
+	// if err != nil {
+	// 	return nil, status.Errorf(codes.Internal, fmt.Sprintf("Initialize volume %s connection failed %v", volumeID, err))
+	// }
+	connInfo := req.GetPublishContext()
 	protocol := connInfo["driver_volume_type"]
 	strProtocol := fmt.Sprint(protocol)
-	conn := brick.NewConnector(strProtocol, connInfo)
+	conn := brick.NewConnector(strProtocol, map[string]interface{}{})
 	devicePath := conn.GetDevicePath()
 	// View the target path dir whether symlink
 	exists, err := utilpath.Exists(utilpath.CheckFollowSymlink, podVolumePath)
@@ -423,8 +432,8 @@ func nodePublishBlockVolume(req *csi.NodePublishVolumeRequest, ns *nodeServer, m
 		}
 		return nil, status.Errorf(codes.Internal, "Could not mount %q at %q: %v", devicePath, targetPath, err)
 	}
-	if err = ns.cloud.AttachVolume(volumeID, targetPath, ns.driver.nodeId); err != nil {
-		return nil, status.Error(codes.Internal, fmt.Sprintf("Cinder attach block volume failed with error %v", err))
-	}
+	// if err = ns.cloud.AttachVolume(volumeID, targetPath, ns.driver.nodeId); err != nil {
+	// 	return nil, status.Error(codes.Internal, fmt.Sprintf("Cinder attach block volume failed with error %v", err))
+	// }
 	return &csi.NodePublishVolumeResponse{}, nil
 }

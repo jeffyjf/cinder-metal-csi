@@ -3,20 +3,21 @@ package driver
 import (
 	"fmt"
 	"strconv"
+	"strings"
 
 	"github.com/container-storage-interface/spec/lib/go/csi"
 	"github.com/gophercloud/gophercloud/openstack/blockstorage/v3/snapshots"
-	"github.com/kungze/cinder-metal-csi/pkg/openstack"
 	"golang.org/x/net/context"
 	"google.golang.org/grpc/codes"
 	"google.golang.org/grpc/status"
 	"google.golang.org/protobuf/types/known/timestamppb"
 	"k8s.io/klog/v2"
+
+	"github.com/kungze/cinder-metal-csi/pkg/openstack"
 )
 
 type ControllerServer struct {
 	driver *Driver
-	cloud  openstack.IOpenstack
 }
 
 func (c *ControllerServer) CreateVolume(ctx context.Context, req *csi.CreateVolumeRequest) (*csi.CreateVolumeResponse, error) {
@@ -26,16 +27,20 @@ func (c *ControllerServer) CreateVolume(ctx context.Context, req *csi.CreateVolu
 	}
 	size := RoundOffBytes(req.GetCapacityRange().GetRequiredBytes())
 	if size < 1 {
-		return nil, status.Error(codes.InvalidArgument, "CreateVolume: The cinder volume size not less than 1")
+		return nil, status.Error(codes.InvalidArgument, "CreateVolume: The volume size must greater than 1GB")
 	}
-	volumeType := req.GetParameters()["type"]
+	volumeType := req.GetParameters()["cinderVolumeType"]
 	if volumeType == "" {
-		return nil, status.Error(codes.InvalidArgument, "CreateVolume: The volume type must")
+		return nil, status.Error(codes.InvalidArgument, "CreateVolume: The StorageClass 'cinderVolumeType' is required.")
+	}
+	cloud, err := openstack.CreateOpenstackClient(req.GetSecrets())
+	if err != nil {
+		return nil, status.Error(codes.Internal, fmt.Sprintf("CreateVolume: Failed to initial openstack cinder client: %v", err))
 	}
 	// Verify that a volume with the same name exists
-	vol, err := c.cloud.GetVolumeByName(name)
+	vol, err := cloud.GetVolumeByName(name)
 	if err != nil {
-		return nil, status.Error(codes.Internal, fmt.Sprintf("CreateVolume: Failed to get volumes: %v", err))
+		return nil, status.Error(codes.Internal, fmt.Sprintf("CreateVolume: Encounter error while try to query cinder volume: %v", err))
 	}
 	if len(vol) == 1 {
 		if size != vol[0].Size {
@@ -50,29 +55,30 @@ func (c *ControllerServer) CreateVolume(ctx context.Context, req *csi.CreateVolu
 	} else if len(vol) > 1 {
 		return nil, status.Error(codes.Internal, "CreateVolume: Multiple volumes reported by cinder with same name")
 	}
-	var snapshotID string
-	var sourceVolID string
 
-	snapshotID = req.GetVolumeContentSource().GetSnapshot().GetSnapshotId()
+	snapshotID := req.GetVolumeContentSource().GetSnapshot().GetSnapshotId()
 	if snapshotID != "" {
-		_, err := c.cloud.GetSnapshotByID(snapshotID)
+		_, err := cloud.GetSnapshotByID(snapshotID)
 		if err != nil {
 			return nil, status.Errorf(codes.Internal, "Failed to retrieve the snapshot %s: %v", snapshotID, err)
 		}
 	}
 
-	sourceVolID = req.GetVolumeContentSource().GetVolume().GetVolumeId()
+	sourceVolID := req.GetVolumeContentSource().GetVolume().GetVolumeId()
 	if sourceVolID != "" {
-		_, err := c.cloud.GetVolumeByID(sourceVolID)
+		_, err := cloud.GetVolumeByID(sourceVolID)
 		if err != nil {
 			return nil, status.Errorf(codes.Internal, "Failed to retrieve the source volume %s: %v", sourceVolID, err)
 		}
 	}
-	zone, err := c.cloud.GetAvailability()
-	if err != nil {
-		return nil, status.Error(codes.Internal, fmt.Sprintf("CreateVolume: Get volume Availability zone failed, %v", err))
+	region := req.GetParameters()["osRegion"]
+	if region == "" {
+		region, err = cloud.GetAvailability()
+		if err != nil {
+			return nil, status.Error(codes.Internal, fmt.Sprintf("CreateVolume: Get volume Availability zone failed, %v", err))
+		}
 	}
-	volume, err := c.cloud.CreateVolume(name, zone, volumeType, snapshotID, sourceVolID, size)
+	volume, err := cloud.CreateVolume(name, region, volumeType, snapshotID, sourceVolID, size)
 	if err != nil {
 		return nil, status.Error(codes.Internal, fmt.Sprintf("CreateVolume: Request openstack create volume failed, %v", err))
 	}
@@ -91,24 +97,102 @@ func (c *ControllerServer) DeleteVolume(ctx context.Context, req *csi.DeleteVolu
 	if volumeID == "" {
 		return nil, status.Error(codes.NotFound, "DeleteVolume: The volume ID not exists!!")
 	}
-	err = c.cloud.DetachVolume(volumeID)
+	cloud, err := openstack.CreateOpenstackClient(req.GetSecrets())
 	if err != nil {
-		return nil, status.Errorf(codes.Internal, fmt.Sprintf("DeleteVolume: Detach the volume %s failed, %v", volumeID, err))
+		return nil, status.Error(codes.Internal, fmt.Sprintf("DeleteVolume: Failed to initial openstack cinder client: %v", err))
 	}
-	err = c.cloud.DeleteVolume(volumeID)
+	err = cloud.DeleteVolume(volumeID)
 	if err != nil {
-		return nil, status.Error(codes.Internal, fmt.Sprintf("DeleteVolume: Delete the volume %s failed, %v", volumeID, err))
+		return nil, status.Error(codes.Internal, fmt.Sprintf("DeleteVolume: Delete the volume %s failed: %v", volumeID, err))
 	}
 	klog.Infof("DeleteVolume: Delete the volume %s success", volumeID)
 	return &csi.DeleteVolumeResponse{}, nil
 }
 
-func (c *ControllerServer) ControllerPublishVolume(ctx context.Context, request *csi.ControllerPublishVolumeRequest) (*csi.ControllerPublishVolumeResponse, error) {
-	return nil, status.Error(codes.Unimplemented, "ControllerPublishVolume is not yet implemented")
+const (
+	RBD   = "rbd"
+	ISCSI = "iscsi"
+)
+
+func convertConnectionInfoToContext(connInfo map[string]interface{}, req *csi.ControllerPublishVolumeRequest) (*connectionContext, error) {
+	connContext := connectionContext{}
+	data := connInfo["data"].(map[string]interface{})
+	connContext.volumeID = fmt.Sprint(data["volume_id"])
+	connProto := fmt.Sprint(data["driver_volume_type"])
+	switch strings.ToLower(connProto) {
+	case RBD:
+		var monAddrs []string
+		hosts := data["hosts"].([]string)
+		ports := data["ports"].([]string)
+		for index, host := range hosts {
+			monAddrs = append(monAddrs, host+":"+ports[index])
+		}
+		keyring := req.GetSecrets()["keyring"]
+		if keyring == "" {
+			keyring = fmt.Sprint(data["keyring"])
+		}
+		connContext.monHosts = strings.Join(monAddrs, ",")
+		connContext.keyring = keyring
+	case ISCSI:
+
+	default:
+		return nil, fmt.Errorf("Connecton protocol: %s don't support.", connProto)
+	}
+	return &connContext, nil
 }
 
-func (c *ControllerServer) ControllerUnpublishVolume(ctx context.Context, request *csi.ControllerUnpublishVolumeRequest) (*csi.ControllerUnpublishVolumeResponse, error) {
-	return nil, status.Error(codes.Unimplemented, "ControllerUnpublishVolume is not yet implemented")
+type connectionContext struct {
+	volumeID         string
+	name             string
+	authEnabled      string
+	authUsername     string
+	authMethod       string
+	authPassword     string
+	driverVolumeType string
+	targetDiscovered string
+	targetPortals    string
+	targetIqns       string
+	targetLuns       string
+	targetPortal     string
+	targetIqn        string
+	targetLun        string
+	monHosts         string
+	clusterName      string
+	keyring          string
+}
+
+func (c *ControllerServer) ControllerPublishVolume(ctx context.Context, req *csi.ControllerPublishVolumeRequest) (*csi.ControllerPublishVolumeResponse, error) {
+	volumeID := req.GetVolumeId()
+	if volumeID == "" {
+		return nil, status.Error(codes.NotFound, "ControllerPublishVolume: The volume ID not exists!!")
+	}
+	cloud, err := openstack.CreateOpenstackClient(req.GetSecrets())
+	if err != nil {
+		return nil, status.Error(codes.Internal, fmt.Sprintf("ControllerPublishVolume: Failed to initial openstack cinder client: %v", err))
+	}
+	_, err = cloud.CreateAttachment(volumeID)
+	if err != nil {
+		return nil, status.Error(codes.Internal, fmt.Sprintf("ControllerPublishVolume: Failed to create attachment: %v", err))
+	}
+	return &csi.ControllerPublishVolumeResponse{
+		PublishContext: req.GetSecrets(),
+	}, nil
+}
+
+func (c *ControllerServer) ControllerUnpublishVolume(ctx context.Context, req *csi.ControllerUnpublishVolumeRequest) (*csi.ControllerUnpublishVolumeResponse, error) {
+	volumeID := req.GetVolumeId()
+	if volumeID == "" {
+		return nil, status.Error(codes.NotFound, "ControllerPublishVolume: The volume ID not exists!!")
+	}
+	cloud, err := openstack.CreateOpenstackClient(req.GetSecrets())
+	if err != nil {
+		return nil, status.Error(codes.Internal, fmt.Sprintf("ControllerUnpublishVolume: Failed to initial openstack cinder client: %v", err))
+	}
+	err = cloud.DeleteAttachmentByVolumeId(volumeID)
+	if err != nil {
+		return nil, err
+	}
+	return &csi.ControllerUnpublishVolumeResponse{}, nil
 }
 
 func (c *ControllerServer) ValidateVolumeCapabilities(ctx context.Context, request *csi.ValidateVolumeCapabilitiesRequest) (*csi.ValidateVolumeCapabilitiesResponse, error) {
@@ -116,36 +200,7 @@ func (c *ControllerServer) ValidateVolumeCapabilities(ctx context.Context, reque
 }
 
 func (c *ControllerServer) ListVolumes(ctx context.Context, req *csi.ListVolumesRequest) (*csi.ListVolumesResponse, error) {
-	maxEntry := req.GetMaxEntries()
-	marker := req.GetStartingToken()
-	if maxEntry == 0 {
-		return nil, status.Error(codes.InvalidArgument, "ListVolumes: The max entry not ")
-	}
-	if marker == "" {
-		return nil, status.Error(codes.InvalidArgument, "ListVolumes: The startingToken must provider")
-	}
-	volList, nextToken, err := c.cloud.ListVolume(maxEntry, marker)
-	if err != nil {
-		return nil, status.Errorf(codes.Internal, "ListVolumes: Get the volume list failed, %v", err)
-	}
-	var vEntries []*csi.ListVolumesResponse_Entry
-	for _, v := range volList {
-		ventry := &csi.ListVolumesResponse_Entry{
-			Volume: &csi.Volume{
-				VolumeId:      v.ID,
-				CapacityBytes: int64(v.Size) * 1024 * 1024 * 1024,
-			},
-		}
-		status := csi.ListVolumesResponse_VolumeStatus{}
-		for _, attach := range v.Attachments {
-			status.PublishedNodeIds = append(status.PublishedNodeIds, attach.AttachmentID)
-		}
-		vEntries = append(vEntries, ventry)
-	}
-	return &csi.ListVolumesResponse{
-		Entries:   vEntries,
-		NextToken: nextToken,
-	}, nil
+	return nil, status.Error(codes.Unimplemented, "ListVolumes is not yet implemented")
 }
 
 func (c *ControllerServer) GetCapacity(ctx context.Context, req *csi.GetCapacityRequest) (*csi.GetCapacityResponse, error) {
@@ -167,11 +222,14 @@ func (c *ControllerServer) CreateSnapshot(ctx context.Context, req *csi.CreateSn
 	if name == "" {
 		return nil, status.Error(codes.InvalidArgument, "CreateSnapshot: The create snapshot name is none")
 	}
-
+	cloud, err := openstack.CreateOpenstackClient(req.GetSecrets())
+	if err != nil {
+		return nil, status.Error(codes.Internal, fmt.Sprintf("CreateVolume: Failed to initial openstack cinder client: %v", err))
+	}
 	// Verify a snapshot with the provided name doesn't already exist for this tenant
 	filter := map[string]string{}
 	filter["name"] = name
-	snapshot, _, err := c.cloud.ListSnapshot(filter)
+	snapshot, _, err := cloud.ListSnapshot(filter)
 	if err != nil {
 		return nil, status.Errorf(codes.Internal, fmt.Sprintf("CreateSnapshot: Get the snapshots info failed, %v", err))
 	}
@@ -190,7 +248,7 @@ func (c *ControllerServer) CreateSnapshot(ctx context.Context, req *csi.CreateSn
 				properties[mKey] = v
 			}
 		}
-		snap, err = c.cloud.CreateSnapShot(name, sourceVolumeId)
+		snap, err = cloud.CreateSnapShot(name, sourceVolumeId)
 		if err != nil {
 			return nil, status.Errorf(codes.Internal, "CreateSnapshot: Create snapshot volume %s failed, %v", name, err)
 		}
@@ -212,7 +270,11 @@ func (c *ControllerServer) DeleteSnapshot(ctx context.Context, req *csi.DeleteSn
 	if snapshotID == "" {
 		return nil, status.Error(codes.InvalidArgument, "DeleteSnapshot: The snapshot volume ID is required fields")
 	}
-	err := c.cloud.DeleteSnapshot(snapshotID)
+	cloud, err := openstack.CreateOpenstackClient(req.GetSecrets())
+	if err != nil {
+		return nil, status.Error(codes.Internal, fmt.Sprintf("CreateVolume: Failed to initial openstack cinder client: %v", err))
+	}
+	err = cloud.DeleteSnapshot(snapshotID)
 	if err != nil {
 		return nil, status.Errorf(codes.Internal, "DeleteSnapshot: Delete snapshot volume id %s is failed, %v", snapshotID, err)
 	}
@@ -221,9 +283,13 @@ func (c *ControllerServer) DeleteSnapshot(ctx context.Context, req *csi.DeleteSn
 }
 
 func (c *ControllerServer) ListSnapshots(ctx context.Context, req *csi.ListSnapshotsRequest) (*csi.ListSnapshotsResponse, error) {
+	cloud, err := openstack.CreateOpenstackClient(req.GetSecrets())
+	if err != nil {
+		return nil, status.Error(codes.Internal, fmt.Sprintf("CreateVolume: Failed to initial openstack cinder client: %v", err))
+	}
 	snapshotID := req.GetSnapshotId()
 	if snapshotID != "" {
-		snapshot, err := c.cloud.GetSnapshotByID(snapshotID)
+		snapshot, err := cloud.GetSnapshotByID(snapshotID)
 		if err != nil {
 			return nil, status.Errorf(codes.Internal, fmt.Sprintf("ListSnapshots: Get snapshot volume info failed, %v", err))
 		}
@@ -250,7 +316,7 @@ func (c *ControllerServer) ListSnapshots(ctx context.Context, req *csi.ListSnaps
 		filter["marker"] = req.StartingToken
 	}
 	filter["status"] = "available"
-	snapshot, nextToken, err := c.cloud.ListSnapshot(filter)
+	snapshot, nextToken, err := cloud.ListSnapshot(filter)
 	if err != nil {
 		return nil, status.Errorf(codes.Internal, fmt.Sprintf("ListSnapshots: Get snapshot volume list failed, %v", err))
 	}
@@ -285,7 +351,11 @@ func (c *ControllerServer) ControllerExpandVolume(ctx context.Context, req *csi.
 	if maxSize > 0 && maxSize < sizeBytes {
 		return nil, status.Error(codes.OutOfRange, "ControllerExpandVolume: The volume size exceeds the limit specified")
 	}
-	vol, err := c.cloud.GetVolumeByID(volumeID)
+	cloud, err := openstack.CreateOpenstackClient(req.GetSecrets())
+	if err != nil {
+		return nil, status.Error(codes.Internal, fmt.Sprintf("CreateVolume: Failed to initial openstack cinder client: %v", err))
+	}
+	vol, err := cloud.GetVolumeByID(volumeID)
 	if err != nil {
 		return nil, status.Errorf(codes.Internal, fmt.Sprintf("ControllerExpandVolume: Get volume %s info failed, %v", volumeID, err))
 	}
@@ -297,7 +367,7 @@ func (c *ControllerServer) ControllerExpandVolume(ctx context.Context, req *csi.
 			NodeExpansionRequired: false,
 		}, nil
 	}
-	err = c.cloud.ExpandVolume(volumeID, vol.Status, size)
+	err = cloud.ExpandVolume(volumeID, vol.Status, size)
 	if err != nil {
 		return nil, status.Errorf(codes.Internal, fmt.Sprintf("ControllerExpandVolume: Request expand volume %s failed, %v", vol.ID, err))
 	}
@@ -309,31 +379,11 @@ func (c *ControllerServer) ControllerExpandVolume(ctx context.Context, req *csi.
 }
 
 func (c *ControllerServer) ControllerGetVolume(ctx context.Context, req *csi.ControllerGetVolumeRequest) (*csi.ControllerGetVolumeResponse, error) {
-	volumeID := req.GetVolumeId()
-	if volumeID == "" {
-		return nil, status.Error(codes.InvalidArgument, "ControllerGetVolume: The volume id must exists")
-	}
-	vol, err := c.cloud.GetVolumeByID(volumeID)
-	if err != nil {
-		return nil, status.Errorf(codes.Internal, fmt.Sprintf("ControllerGetVolume: Get volume %s info failed, %v", volumeID, err))
-	}
-	var status *csi.ControllerGetVolumeResponse_VolumeStatus
-	for _, v := range vol.Attachments {
-		status.PublishedNodeIds = append(status.PublishedNodeIds, v.HostName)
-	}
-
-	return &csi.ControllerGetVolumeResponse{
-		Volume: &csi.Volume{
-			VolumeId:      vol.ID,
-			CapacityBytes: int64(vol.Size) * 1024 * 1024 * 1024,
-		},
-		Status: status,
-	}, nil
+	return nil, status.Error(codes.Unimplemented, "ControllerGetVolume is not yet implemented")
 }
 
-func NewControllerServer(d *Driver, cloud openstack.IOpenstack) csi.ControllerServer {
+func NewControllerServer(d *Driver) csi.ControllerServer {
 	return &ControllerServer{
 		driver: d,
-		cloud:  cloud,
 	}
 }

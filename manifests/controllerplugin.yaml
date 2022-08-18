@@ -1,11 +1,11 @@
-# This YAML file contains CSI Controller Plugin Sidecars
+# This YAML file contains cinder-metal-csi Controller Plugin Sidecars
 # external-attacher, external-provisioner, external-snapshotter
 # external-resize, liveness-probe
 
 kind: Deployment
 apiVersion: apps/v1
 metadata:
-  name: cinder-metal-csi-controller-plugin
+  name: cinder-metal-csi-controller
   namespace: kube-system
 spec:
   replicas: 1
@@ -23,8 +23,6 @@ spec:
         app: cinder-metal-csi-controller-plugin
     spec:
       serviceAccount: cinder-metal-csi-controller-sa
-      nodeSelector:
-        controller: enabled
       dnsPolicy: ClusterFirstWithHostNet
       containers:
         - name: csi-attacher
@@ -98,8 +96,8 @@ spec:
           imagePullPolicy: "IfNotPresent"
           args:
             - /bin/cinder-metal-csi
-            - "--endpoint=$(CSI_ENDPOINT)"
-            - "--cloud-conf=$(CLOUD_CONFIG)"
+            - "--endpoint=unix:///csi/csi.sock"
+            - "--cloud-conf=/etc/cloud/cloud.conf"
             - "--node-id=$(NODE_ID)"
             - "--v=3"
           env:
@@ -107,10 +105,6 @@ spec:
               valueFrom:
                 fieldRef:
                   fieldPath: status.hostIP
-            - name: CSI_ENDPOINT
-              value: unix:///csi/csi.sock
-            - name: CLOUD_CONFIG
-              value: /etc/cloud/cloud.conf
           volumeMounts:
             - name: socket-dir
               mountPath: /csi

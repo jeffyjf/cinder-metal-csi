@@ -5,7 +5,6 @@ import (
 
 	"github.com/container-storage-interface/spec/lib/go/csi"
 	"github.com/kungze/cinder-metal-csi/pkg/mount"
-	"github.com/kungze/cinder-metal-csi/pkg/openstack"
 	"google.golang.org/grpc/codes"
 	"google.golang.org/grpc/status"
 	"k8s.io/klog/v2"
@@ -29,7 +28,7 @@ type Driver struct {
 	vcap []*csi.VolumeCapability_AccessMode
 }
 
-func NewDriver(nodeId, version, endpoint string, cloud openstack.IOpenstack, mount mount.IMount) *Driver {
+func NewDriver(nodeId, version, endpoint string, mount mount.IMount) *Driver {
 	d := &Driver{}
 	d.name = driverName
 	d.nodeId = nodeId
@@ -37,20 +36,21 @@ func NewDriver(nodeId, version, endpoint string, cloud openstack.IOpenstack, mou
 	d.version = version
 	d.AddControllerCapability([]csi.ControllerServiceCapability_RPC_Type{
 		csi.ControllerServiceCapability_RPC_LIST_SNAPSHOTS,
-		csi.ControllerServiceCapability_RPC_LIST_VOLUMES,
+		//csi.ControllerServiceCapability_RPC_LIST_VOLUMES,
 		csi.ControllerServiceCapability_RPC_GET_VOLUME,
 		csi.ControllerServiceCapability_RPC_CREATE_DELETE_VOLUME,
 		csi.ControllerServiceCapability_RPC_CREATE_DELETE_SNAPSHOT,
 		csi.ControllerServiceCapability_RPC_EXPAND_VOLUME,
 		csi.ControllerServiceCapability_RPC_CLONE_VOLUME,
+		csi.ControllerServiceCapability_RPC_PUBLISH_UNPUBLISH_VOLUME,
 	})
 	d.AddVolumeCapability([]csi.VolumeCapability_AccessMode_Mode{
 		csi.VolumeCapability_AccessMode_MULTI_NODE_SINGLE_WRITER,
 	})
 
-	d.cs = NewControllerServer(d, cloud)
-	d.ids = NewIdentityServer(d, cloud)
-	d.ns = NewNodeServer(d, cloud, mount)
+	d.cs = NewControllerServer(d)
+	d.ids = NewIdentityServer(d)
+	d.ns = NewNodeServer(d, mount)
 
 	return d
 }

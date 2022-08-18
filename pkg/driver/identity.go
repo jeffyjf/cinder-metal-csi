@@ -58,16 +58,11 @@ func (i *identityServer) GetPluginCapabilities(ctx context.Context, req *csi.Get
 }
 
 func (i *identityServer) Probe(ctx context.Context, req *csi.ProbeRequest) (*csi.ProbeResponse, error) {
-	err := i.cloud.CheckBlockStorageAPI()
-	if err != nil {
-		return nil, status.Errorf(codes.Internal, "The openstack cinder api check failed, err: %v", err)
-	}
 	return &csi.ProbeResponse{}, nil
 }
 
-func NewIdentityServer(d *Driver, cloud openstack.IOpenstack) csi.IdentityServer {
+func NewIdentityServer(d *Driver) csi.IdentityServer {
 	return &identityServer{
 		driver: d,
-		cloud:  cloud,
 	}
 }
