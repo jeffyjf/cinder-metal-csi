@@ -37,14 +37,14 @@ func main() {
 	klog.Flush()
 	err := command.Execute()
 	if err != nil {
-		klog.Fatalf(fmt.Sprintf("Exec command failed, %v", err))
+		klog.Fatalf(fmt.Sprintf("Exec command failed. Error: %s", err.Error()))
 	}
 }
 
 func handler(nodeID, version, endpoint, cloudConf string) {
 	cloud, err := openstack.CreateOpenstackClient(cloudConf)
 	if err != nil {
-		klog.Fatalf("Get openstack client failed, &v", err)
+		klog.Fatalf("Initial openstack client failed. Error: %s", err.Error())
 	}
 	mount := mount.NewNodeMount()
 	driver := driver.NewDriver(nodeID, version, endpoint, cloud, mount)

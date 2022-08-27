@@ -74,19 +74,19 @@ func (op *Openstack) DetachVolume(volumeID string) error {
 func (op *Openstack) GetVolumeByName(volumeName string) ([]volumes.Volume, error) {
 	blockStorageClient, err := openstack.NewBlockStorageV3(op.BlockStorageClient.ProviderClient, op.EsOpts)
 	if err != nil {
-		klog.Error(fmt.Sprintf("Request block storage client failed, %v", err))
+		klog.Error(fmt.Sprintf("Request block storage client failed. Error: %s", err.Error()))
 		return nil, err
 	}
 	blockStorageClient.Microversion = "3.34"
 	opts := volumes.ListOpts{Name: volumeName}
 	page, err := volumes.List(blockStorageClient, opts).AllPages()
 	if err != nil {
-		klog.Error(fmt.Sprintf("Get volume list failed, %v", err))
+		klog.Error(fmt.Sprintf("List cinder volumes encounter error. Error: %s", err.Error()))
 		return nil, err
 	}
 	vol, err := volumes.ExtractVolumes(page)
 	if err != nil {
-		klog.Error(fmt.Sprintf("Extract the volume page failed, %v", err))
+		klog.Error(fmt.Sprintf("Extract the volume page failed. Error: %s", err.Error()))
 		return nil, err
 	}
 	return vol, nil
@@ -95,7 +95,7 @@ func (op *Openstack) GetVolumeByName(volumeName string) ([]volumes.Volume, error
 func (op *Openstack) GetVolumeByID(volumeID string) (*volumes.Volume, error) {
 	vol, err := volumes.Get(op.BlockStorageClient, volumeID).Extract()
 	if err != nil {
-		klog.Error(fmt.Sprintf("Get volume info failed, %v", err))
+		klog.Error(fmt.Sprintf("Get cinder volume info failed. Error: %s", err.Error()))
 		return nil, err
 	}
 	return vol, nil
